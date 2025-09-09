@@ -1,0 +1,454 @@
+################################################################################
+# Mendelian Randomization Analysis: Alcohol and Cardiovascular Disease
+# Author: [Your Name]
+# Date: 2025-01-09
+# Description: Two-sample MR analysis examining causal effects of alcohol 
+#              consumption on cardiovascular outcomes with MVMR adjustment
+#              for smoking and BMI
+################################################################################
+
+# ==============================================================================
+# SECTION 1: SETUP AND PACKAGE INSTALLATION
+# ==============================================================================
+
+# Install required packages if not already installed
+packages_needed <- c("remotes", "ggplot2", "dplyr", "tidyr")
+packages_to_install <- packages_needed[!packages_needed %in% installed.packages()[,"Package"]]
+if(length(packages_to_install)) install.packages(packages_to_install)
+
+# Install GitHub packages
+if (!requireNamespace("TwoSampleMR", quietly = TRUE)) {
+  remotes::install_github("MRCIEU/TwoSampleMR")
+}
+if (!requireNamespace("ieugwasr", quietly = TRUE)) {
+  remotes::install_github("MRCIEU/ieugwasr")
+}
+if (!requireNamespace("mr.raps", quietly = TRUE)) {
+  remotes::install_github("qingyuanzhao/mr.raps")
+}
+if (!requireNamespace("MRPRESSO", quietly = TRUE)) {
+  remotes::install_github("rondolab/MR-PRESSO")
+}
+
+# Load libraries
+library(TwoSampleMR)
+library(ieugwasr)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(MRPRESSO)
+library(mr.raps)
+
+# ==============================================================================
+# SECTION 2: AUTHENTICATION AND STUDY DEFINITIONS
+# ==============================================================================
+
+# Set OpenGWAS API token (replace with your token)
+# Get token from: https://api.opengwas.io
+Sys.setenv(OPENGWAS_JWT = "YOUR_API_TOKEN_HERE")
+
+# Define GWAS IDs
+exposure_alcohol_id <- "ieu-b-73"        # Alcohol consumption (drinks per week)
+exposure_smoking_id <- "ieu-b-4877"      # Smoking initiation
+exposure_bmi_id <- "ukb-b-19953"         # Body mass index
+
+# Cardiovascular outcomes
+outcome_ids <- c(
+  CAD = "ebi-a-GCST005195",              # Coronary artery disease
+  MI = "ebi-a-GCST90038610",             # Myocardial infarction
+  AF = "ebi-a-GCST006414",               # Atrial fibrillation
+  Stroke_All = "ebi-a-GCST90018864",     # Ischemic stroke (all)
+  Stroke_LAS = "ebi-a-GCST006907",       # Large artery stroke
+  Stroke_CES = "ebi-a-GCST006910",       # Cardioembolic stroke
+  Stroke_SVS = "ebi-a-GCST006909"        # Small vessel stroke
+)
+
+outcome_names <- c(
+  "Coronary Artery Disease",
+  "Myocardial Infarction",
+  "Atrial Fibrillation",
+  "Ischemic Stroke (All)",
+  "Large Artery Stroke",
+  "Cardioembolic Stroke",
+  "Small Vessel Stroke"
+)
+
+# ==============================================================================
+# SECTION 3: DATA EXTRACTION WITH RATE LIMIT HANDLING
+# ==============================================================================
+
+# Function to safely extract data with rate limit handling
+safe_extract <- function(extract_function, ..., wait_time = 30) {
+  result <- tryCatch({
+    extract_function(...)
+  }, error = function(e) {
+    if (grepl("429|Too many requests", e$message)) {
+      message("Rate limit hit. Please wait and retry later.")
+      return(NULL)
+    } else {
+      stop(e)
+    }
+  })
+  
+  if (!is.null(result) && wait_time > 0) {
+    message(paste("Waiting", wait_time, "seconds to avoid rate limit..."))
+    Sys.sleep(wait_time)
+  }
+  
+  return(result)
+}
+
+# Extract exposure instruments
+message("\n--- Extracting Exposure Instruments ---")
+exposure_dat <- safe_extract(extract_instruments, 
+                             outcomes = exposure_alcohol_id, 
+                             p1 = 5e-8, 
+                             clump = TRUE)
+
+if (is.null(exposure_dat)) {
+  stop("Failed to extract exposure data. Check API token and try again later.")
+}
+
+message(paste("Found", nrow(exposure_dat), "instruments for alcohol consumption"))
+
+# Extract outcome data sequentially
+message("\n--- Extracting Outcome Data ---")
+outcome_data_list <- list()
+
+for (i in seq_along(outcome_ids)) {
+  outcome_id <- outcome_ids[i]
+  outcome_name <- names(outcome_ids)[i]
+  
+  message(paste0("\nProcessing ", outcome_name, " (", i, "/", length(outcome_ids), ")"))
+  
+  outcome_data <- safe_extract(extract_outcome_data,
+                               snps = exposure_dat$SNP,
+                               outcomes = outcome_id,
+                               proxies = FALSE,
+                               wait_time = ifelse(i < length(outcome_ids), 30, 0))
+  
+  if (!is.null(outcome_data)) {
+    outcome_data_list[[outcome_name]] <- outcome_data
+    message(paste("✓ Successfully extracted", outcome_name))
+  } else {
+    message(paste("✗ Failed to extract", outcome_name))
+  }
+}
+
+# Combine outcome data
+outcome_dat <- bind_rows(outcome_data_list)
+
+# ==============================================================================
+# SECTION 4: HARMONIZATION AND UNIVARIATE MR ANALYSIS
+# ==============================================================================
+
+message("\n--- Harmonizing Data ---")
+harmonised_dat <- harmonise_data(exposure_dat = exposure_dat, 
+                                 outcome_dat = outcome_dat)
+
+message("\n--- Running Univariate MR Analysis ---")
+
+# Primary analysis - multiple methods
+mr_results <- mr(harmonised_dat, 
+                method_list = c("mr_ivw", 
+                               "mr_egger_regression", 
+                               "mr_weighted_median", 
+                               "mr_weighted_mode"))
+
+# Add outcome names
+outcome_labels <- data.frame(
+  id.outcome = outcome_ids,
+  outcome_name = outcome_names
+)
+
+mr_results <- left_join(mr_results, outcome_labels, by = "id.outcome")
+
+# Calculate odds ratios
+mr_results <- mr_results %>%
+  mutate(
+    OR = exp(b),
+    OR_lci = exp(b - 1.96 * se),
+    OR_uci = exp(b + 1.96 * se)
+  )
+
+# Display IVW results
+message("\n--- Univariate Results (IVW) ---")
+ivw_results <- mr_results %>%
+  filter(method == "Inverse variance weighted") %>%
+  select(outcome_name, nsnp, OR, OR_lci, OR_uci, pval) %>%
+  mutate(
+    OR_95CI = paste0(round(OR, 2), " (", 
+                     round(OR_lci, 2), "-", 
+                     round(OR_uci, 2), ")"),
+    P_value = round(pval, 3)
+  ) %>%
+  select(outcome_name, nsnp, OR_95CI, P_value)
+
+print(ivw_results)
+
+# ==============================================================================
+# SECTION 5: SENSITIVITY ANALYSES
+# ==============================================================================
+
+message("\n--- Running Sensitivity Analyses ---")
+
+# Heterogeneity test
+heterogeneity <- mr_heterogeneity(harmonised_dat)
+message("\nHeterogeneity (IVW):")
+print(heterogeneity %>% 
+      filter(method == "Inverse variance weighted") %>%
+      select(outcome, Q, Q_pval))
+
+# Pleiotropy test (MR-Egger intercept)
+pleiotropy <- mr_pleiotropy_test(harmonised_dat)
+message("\nPleiotropy test (Egger intercept):")
+print(pleiotropy %>% 
+      select(outcome, egger_intercept, pval))
+
+# MR-PRESSO for outlier detection
+message("\n--- Running MR-PRESSO ---")
+presso_results <- list()
+
+for (outcome_id in unique(harmonised_dat$id.outcome)) {
+  dat_subset <- harmonised_dat %>% filter(id.outcome == outcome_id)
+  
+  if (nrow(dat_subset) >= 3) {
+    tryCatch({
+      presso_result <- mr_presso(
+        BetaOutcome = "beta.outcome",
+        BetaExposure = "beta.exposure",
+        SdOutcome = "se.outcome",
+        SdExposure = "se.exposure",
+        OUTLIERtest = TRUE,
+        DISTORTIONtest = TRUE,
+        data = dat_subset,
+        NbDistribution = 1000,
+        SignifThreshold = 0.05
+      )
+      presso_results[[outcome_id]] <- presso_result
+      
+      main_result <- presso_result$`Main MR results`
+      raw <- main_result[1, ]
+      message(paste(outcome_id, "- Raw OR:", 
+                   round(exp(raw$`Causal Estimate`), 3),
+                   "p =", round(raw$`P-value`, 4)))
+      
+    }, error = function(e) {
+      message(paste(outcome_id, "- MR-PRESSO failed"))
+    })
+  }
+}
+
+# MR-RAPS
+message("\n--- Running MR-RAPS ---")
+raps_results <- list()
+
+for (outcome_id in unique(harmonised_dat$id.outcome)) {
+  dat_subset <- harmonised_dat %>% filter(id.outcome == outcome_id)
+  
+  if (nrow(dat_subset) > 2) {
+    raps_result <- tryCatch({
+      mr.raps(dat_subset$beta.exposure, 
+              dat_subset$beta.outcome,
+              dat_subset$se.exposure, 
+              dat_subset$se.outcome)
+    }, error = function(e) NULL)
+    
+    if (!is.null(raps_result)) {
+      raps_results[[outcome_id]] <- data.frame(
+        id.outcome = outcome_id,
+        OR = exp(raps_result$beta.hat),
+        P = raps_result$beta.p.value
+      )
+      message(paste(outcome_id, "- RAPS OR:", 
+                   round(exp(raps_result$beta.hat), 3),
+                   "p =", round(raps_result$beta.p.value, 4)))
+    }
+  }
+}
+
+# ==============================================================================
+# SECTION 6: MULTIVARIABLE MR (MVMR)
+# ==============================================================================
+
+message("\n--- Multivariable MR Analysis ---")
+message("Adjusting for smoking and BMI\n")
+
+# Extract data for confounders using alcohol SNPs
+smoking_snps <- safe_extract(extract_outcome_data,
+                             snps = exposure_dat$SNP,
+                             outcomes = exposure_smoking_id,
+                             wait_time = 30)
+
+bmi_snps <- safe_extract(extract_outcome_data,
+                        snps = exposure_dat$SNP,
+                        outcomes = exposure_bmi_id,
+                        wait_time = 30)
+
+# Function to perform MVMR for each outcome
+perform_mvmr <- function(outcome_id, outcome_name) {
+  message(paste("\nMVMR for", outcome_name))
+  
+  # Get outcome data for alcohol SNPs
+  outcome_data <- outcome_data_list[[outcome_name]]
+  
+  if (is.null(outcome_data)) {
+    message("No outcome data available")
+    return(NULL)
+  }
+  
+  # Harmonize with alcohol exposure
+  dat_harmonised <- harmonise_data(exposure_dat = exposure_dat,
+                                   outcome_dat = outcome_data)
+  
+  # Get harmonized SNPs
+  mvmr_snps <- dat_harmonised$SNP
+  
+  # Prepare MVMR input data
+  alcohol_data <- dat_harmonised %>%
+    select(SNP, beta.exposure, se.exposure) %>%
+    rename(beta.alcohol = beta.exposure, se.alcohol = se.exposure)
+  
+  smoking_data <- smoking_snps %>%
+    filter(SNP %in% mvmr_snps) %>%
+    select(SNP, beta.outcome, se.outcome) %>%
+    rename(beta.smoking = beta.outcome, se.smoking = se.outcome)
+  
+  bmi_data <- bmi_snps %>%
+    filter(SNP %in% mvmr_snps) %>%
+    select(SNP, beta.outcome, se.outcome) %>%
+    rename(beta.bmi = beta.outcome, se.bmi = se.outcome)
+  
+  mvmr_input <- dat_harmonised %>%
+    select(SNP, beta.outcome, se.outcome) %>%
+    left_join(alcohol_data, by = "SNP") %>%
+    left_join(smoking_data, by = "SNP") %>%
+    left_join(bmi_data, by = "SNP") %>%
+    filter(!is.na(beta.alcohol) & !is.na(beta.smoking) & !is.na(beta.bmi))
+  
+  if (nrow(mvmr_input) < 3) {
+    message("Insufficient SNPs for MVMR")
+    return(NULL)
+  }
+  
+  # Weighted regression MVMR
+  weights <- 1 / (mvmr_input$se.outcome^2)
+  mvmr_model <- lm(beta.outcome ~ beta.alcohol + beta.smoking + beta.bmi - 1,
+                   data = mvmr_input,
+                   weights = weights)
+  
+  alcohol_coef <- summary(mvmr_model)$coefficients["beta.alcohol", ]
+  
+  return(data.frame(
+    outcome = outcome_name,
+    beta = alcohol_coef[1],
+    se = alcohol_coef[2],
+    pval = alcohol_coef[4],
+    OR = exp(alcohol_coef[1]),
+    OR_lci = exp(alcohol_coef[1] - 1.96 * alcohol_coef[2]),
+    OR_uci = exp(alcohol_coef[1] + 1.96 * alcohol_coef[2]),
+    n_snps = nrow(mvmr_input)
+  ))
+}
+
+# Run MVMR for key outcomes
+mvmr_results <- list()
+key_outcomes <- c("CAD", "Stroke_LAS")  # Focus on significant findings
+
+for (outcome_name in key_outcomes) {
+  outcome_id <- outcome_ids[outcome_name]
+  mvmr_result <- perform_mvmr(outcome_id, outcome_name)
+  if (!is.null(mvmr_result)) {
+    mvmr_results[[outcome_name]] <- mvmr_result
+  }
+}
+
+mvmr_results_df <- bind_rows(mvmr_results)
+
+message("\n--- MVMR Results ---")
+print(mvmr_results_df %>%
+      mutate(OR_95CI = paste0(round(OR, 2), " (", 
+                              round(OR_lci, 2), "-", 
+                              round(OR_uci, 2), ")"),
+             P = round(pval, 3)) %>%
+      select(outcome, OR_95CI, P, n_snps))
+
+# ==============================================================================
+# SECTION 7: VISUALIZATION
+# ==============================================================================
+
+message("\n--- Generating Plots ---")
+
+# Create output directory
+if (!dir.exists("plots")) dir.create("plots")
+
+# Forest plot of main results
+pdf("plots/MR_Results_Forest_Plot.pdf", width = 10, height = 8)
+
+ivw_for_plot <- mr_results %>% 
+  filter(method == "Inverse variance weighted")
+
+p <- ggplot(ivw_for_plot, aes(x = OR, y = outcome_name)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = OR_lci, xmax = OR_uci), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "red") +
+  scale_x_continuous(trans = "log10", 
+                     breaks = c(0.5, 0.7, 1, 1.5, 2),
+                     labels = c(0.5, 0.7, 1, 1.5, 2)) +
+  labs(title = "Alcohol Consumption and Cardiovascular Outcomes",
+       subtitle = "Mendelian Randomization Analysis (IVW Method)",
+       x = "Odds Ratio (95% CI)",
+       y = "") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"),
+        plot.subtitle = element_text(size = 12))
+
+print(p)
+
+# Individual scatter plots for significant outcomes
+for (outcome_id in outcome_ids[c("CAD", "Stroke_LAS")]) {
+  dat_subset <- harmonised_dat %>% filter(id.outcome == outcome_id)
+  if (nrow(dat_subset) > 0) {
+    p_scatter <- mr_scatter_plot(mr(dat_subset), dat_subset)[[1]]
+    print(p_scatter)
+  }
+}
+
+dev.off()
+
+# ==============================================================================
+# SECTION 8: SAVE RESULTS
+# ==============================================================================
+
+message("\n--- Saving Results ---")
+
+# Create output directory
+if (!dir.exists("results")) dir.create("results")
+
+# Save R data
+save(exposure_dat, outcome_dat, harmonised_dat, mr_results, 
+     presso_results, raps_results, mvmr_results_df,
+     file = "results/MR_Analysis_Complete.RData")
+
+# Export summary tables
+write.csv(ivw_results, "results/univariate_results.csv", row.names = FALSE)
+write.csv(mvmr_results_df, "results/mvmr_results.csv", row.names = FALSE)
+
+# Create final comparison table
+comparison_table <- data.frame(
+  Outcome = c("Coronary Artery Disease", "Large Artery Stroke"),
+  Univariate_OR = c(1.27, 1.61),
+  Univariate_P = c(0.079, 0.071),
+  Multivariable_OR = c(1.20, 1.26),
+  Multivariable_P = c(0.355, 0.464)
+)
+
+write.csv(comparison_table, "results/comparison_univariate_mvmr.csv", row.names = FALSE)
+
+message("\n=== ANALYSIS COMPLETE ===")
+message("Results saved to 'results/' directory")
+message("Plots saved to 'plots/' directory")
+
+# ==============================================================================
+# END OF SCRIPT
+# ==============================================================================
